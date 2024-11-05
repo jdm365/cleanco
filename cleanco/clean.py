@@ -13,7 +13,8 @@ Daddy & Sons
 
 import functools
 import operator
-from collections import OrderedDict
+import ahocorasick
+import heapq
 import re
 import unicodedata
 from .termdata import terms_by_type, terms_by_country
@@ -28,6 +29,15 @@ def get_unique_terms():
     cs = functools.reduce(operator.iconcat, terms_by_country.values(), [])
     return set(ts + cs)
 
+
+# Create dictionary mapping instead
+TRANSLATION_TABLE = str.maketrans({
+    i: '' if unicodedata.combining(chr(i)) else chr(i)
+    for i in range(0x80, 0x10ffff)
+})
+
+def remove_accents_fast(text):
+    return text.casefold().translate(TRANSLATION_TABLE)
 
 def remove_accents(t):
     """based on https://stackoverflow.com/a/51230541"""
@@ -52,15 +62,15 @@ def normalize_terms(terms):
 
 def strip_tail(name):
     "get rid of all trailing non-letter symbols except the dot"
-    match = re.search(tail_removal_rexp, name)
-    if match is not None:
-        name = name[: match.span()[0]]
+    while name and not name[-1].isalnum() and name[-1] != ".":
+        name = name[:-1]
     return name
 
 
 def normalized(text):
     "caseless Unicode normalization"
-    return remove_accents(text)
+    ## return remove_accents(text)
+    return remove_accents_fast(text)
 
 
 def prepare_default_terms():
@@ -73,7 +83,7 @@ def prepare_default_terms():
     return [(len(tp), tp) for tp in sntermparts]
 
 
-def custom_basename(name, terms, suffix=True, prefix=False, middle=False, **kwargs):
+def custom_basename_old(name, terms, suffix=True, prefix=False, middle=False, **kwargs):
     "return cleaned base version of the business name"
 
     name = strip_tail(name)
@@ -83,7 +93,7 @@ def custom_basename(name, terms, suffix=True, prefix=False, middle=False, **kwar
     nnsize = len(nnparts)
 
     if suffix:
-        for termsize, termparts in terms:
+        for idx, (termsize, termparts) in enumerate(terms):
             if nnparts[-termsize:] == termparts:
                 del nnparts[-termsize:]
                 del nparts[-termsize:]
@@ -113,5 +123,84 @@ def custom_basename(name, terms, suffix=True, prefix=False, middle=False, **kwar
     return strip_tail(" ".join(nparts))
 
 
+def build_automaton(terms):
+    "build Aho-Corasick automaton for terms"
+    a = ahocorasick.Automaton()
+    for idx, (_, _term) in enumerate(terms):
+        term = " ".join(_term)
+        a.add_word(term, (idx, term))
+    a.make_automaton()
+    return a
+
+def custom_basename(
+        name, 
+        terms,
+        suffix=True, 
+        prefix=False, 
+        middle=False, 
+        **kwargs,
+        ):
+    "return cleaned base version of the business name"
+    global global_automaton
+    if global_automaton is None:
+        global_automaton = build_automaton(terms)
+
+    name = strip_tail(name)
+
+    ## Get non-alphanumeric tokens for later insertion.
+    non_alphanum_toks = []
+    nparts = []
+    for idx, tok in enumerate(name.split()):
+        stripped_tok = strip_punct(tok)
+        if stripped_tok == "":
+            non_alphanum_toks.append((idx, tok))
+
+        nparts.append(tok)
+
+    nname = normalized(strip_punct(name))
+
+    matches = []
+    for end_idx, (priority_idx, match) in global_automaton.iter(nname):
+        start_idx = end_idx - len(match) + 1
+
+        cond_1 = (not nname[max(0, start_idx - 1)].isalnum()) or (start_idx == 0)
+        cond_2 = (end_idx == len(nname) - 1) or (not nname[min(len(nname) - 1, end_idx + 1)].isalnum())
+
+        if middle:
+            if not prefix:
+                cond_2 &= (start_idx != 0)
+            if not suffix:
+                cond_2 &= (end_idx != len(nname) - 1)
+        else:
+            cond_2 &= (((start_idx == 0) and prefix) or ((end_idx == len(nname) - 1) and suffix))
+
+        if cond_1 and cond_2:
+            heapq.heappush(matches, (priority_idx, (start_idx, end_idx, match)))
+
+    if len(matches) == 0:
+        return name
+
+    char_array = list(nname)
+    for _ in range(len(matches)):
+        _, (start_idx, end_idx, match) = heapq.heappop(matches)
+
+        ## Period should be guaranteed not to be there from strip_punct.
+        char_array[start_idx:end_idx + 1] = "".join(
+                "." if x != " " else x for x in match
+                )
+
+    tokens = "".join(char_array).split()
+    for idx, non_alphanum_tok in non_alphanum_toks:
+        tokens.insert(idx, non_alphanum_tok)
+
+    final = []
+    for idx, x in enumerate(tokens):
+        if len(x.replace(".", "")) != 0:
+            final.append(nparts[idx])
+
+    return strip_tail(" ".join(final))
+
 # convenience for most common use cases that don't parametrize base name extraction
+basename_old = functools.partial(custom_basename_old, terms=prepare_default_terms())
+global_automaton = None
 basename = functools.partial(custom_basename, terms=prepare_default_terms())
